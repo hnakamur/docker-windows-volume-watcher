@@ -3,7 +3,6 @@ package watcher
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -23,32 +22,27 @@ import (
 
 type watcher struct {
 	hostDirWatcher *fsnotify.Watcher
+	ignoreDirs     []string
+	mountPoints    map[string][]mountPoint
 	cli            *client.Client
 }
 
 type mountPoint struct {
-	containerID  string
 	hostDir      string
 	containerDir string
+	ignoreDirs   []string
 }
 
-func Watch(ctx context.Context, apiVersion, hostDir string) error {
-	err := validateHostDir(hostDir)
+// Watch watches changes of host files and notify the change to the container.
+func Watch(ctx context.Context, apiVersion string, ignoreDirs []string) error {
+	w, err := newWatcher(apiVersion, ignoreDirs)
 	if err != nil {
 		return err
 	}
-	hostDir = cleanHostDir(hostDir)
-
-	log.Printf("hostDir=%s", hostDir)
-
-	w, err := newWatcher(apiVersion)
-	if err != nil {
-		return err
-	}
-	return w.Watch(ctx, hostDir)
+	return w.Watch(ctx)
 }
 
-func newWatcher(apiVersion string) (*watcher, error) {
+func newWatcher(apiVersion string, ignoreDirs []string) (*watcher, error) {
 	hostDirWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -58,25 +52,37 @@ func newWatcher(apiVersion string) (*watcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("started docker client")
 
 	return &watcher{
 		hostDirWatcher: hostDirWatcher,
+		ignoreDirs:     ignoreDirs,
+		mountPoints:    make(map[string][]mountPoint),
 		cli:            cli,
 	}, nil
 }
 
-func (w *watcher) Watch(ctx context.Context, hostDir string) error {
-	mountPoints, err := w.listMountPoints(ctx, hostDir)
+func (w *watcher) Watch(ctx context.Context) error {
+	err := w.buildInitialMountPoints(ctx)
 	if err != nil {
 		return err
 	}
 
-	err = w.addWatchDirs(hostDir)
-	if err != nil {
-		return err
+	for containerID, mountPoints := range w.mountPoints {
+		if len(mountPoints) == 0 {
+			continue
+		}
+
+		err = verifyContainerHavingStatAndChmod(ctx, w.cli, containerID)
+		if err != nil {
+			log.Printf(`Skip containerID=%s since it does not have "stat" or "chmod" command`, stringid.TruncateID(containerID))
+			return nil
+		}
+
+		err = w.addWatchDirsForMountPoints(containerID, mountPoints)
+		if err != nil {
+			return err
+		}
 	}
-	log.Printf("started hostDirWatcher")
 
 	msgC, errC := watchContainerEvents(ctx, w.cli)
 	for {
@@ -84,19 +90,12 @@ func (w *watcher) Watch(ctx context.Context, hostDir string) error {
 		case hostDirEvent := <-w.hostDirWatcher.Events:
 			switch hostDirEvent.Op {
 			case fsnotify.Create:
-				log.Printf("hostDirWatcher create event.Name=%s", hostDirEvent.Name)
 				err := w.mayAddWatchDir(hostDirEvent.Name)
 				if err != nil {
 					fmt.Fprintln(os.Stderr, err)
 				}
-			case fsnotify.Remove:
-				log.Printf("hostDirWatcher remove event.Name=%s", hostDirEvent.Name)
-				// NOTE: We don't need to remove watch manually. We got an error if we did.
-			case fsnotify.Rename:
-				log.Printf("hostDirWatcher rename event.Name=%s", hostDirEvent.Name)
-				// NOTE: We don't need to remove watch manually. We got an error if we did.
 			case fsnotify.Write:
-				err := w.notifyWriteToContainer(ctx, mountPoints, hostDirEvent.Name)
+				err := w.notifyWriteToContainer(ctx, hostDirEvent.Name)
 				if err != nil {
 					fmt.Fprintln(os.Stderr, err)
 				}
@@ -105,11 +104,34 @@ func (w *watcher) Watch(ctx context.Context, hostDir string) error {
 			fmt.Fprintln(os.Stderr, err)
 		case msg := <-msgC:
 			//log.Printf("msg=%+v", msg)
+			containerID := msg.Actor.ID
 			switch msg.Action {
-			case "start", "restart", "die", "pause", "unpause":
-				mountPoints, err = w.listMountPoints(ctx, hostDir)
+			case "start", "restart", "unpause":
+				mountPoints, err := w.getMountPoints(ctx, containerID)
 				if err != nil {
 					return err
+				}
+				if len(mountPoints) > 0 {
+					err = verifyContainerHavingStatAndChmod(ctx, w.cli, containerID)
+					if err != nil {
+						log.Printf(`Skip containerID=%s since it does not have "stat" or "chmod" command`, stringid.TruncateID(containerID))
+						return nil
+					}
+					err = w.addWatchDirsForMountPoints(containerID, mountPoints)
+					if err != nil {
+						return err
+					}
+					w.mountPoints[containerID] = mountPoints
+				}
+
+			case "die", "pause":
+				mountPoints := w.mountPoints[containerID]
+				if len(mountPoints) > 0 {
+					err = w.removeWatchDirsForMountPoints(containerID, mountPoints)
+					if err != nil {
+						return err
+					}
+					delete(w.mountPoints, containerID)
 				}
 			}
 		case err := <-errC:
@@ -119,16 +141,70 @@ func (w *watcher) Watch(ctx context.Context, hostDir string) error {
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 			}
-			log.Printf("closed hostDirWatcher")
 
 			err = w.cli.Close()
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 			}
-			log.Printf("closed docker client")
 			return nil
 		}
 	}
+}
+
+func (w *watcher) buildInitialMountPoints(ctx context.Context) error {
+	options := types.ContainerListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("status", "created"),
+			filters.Arg("status", "restarting"),
+			filters.Arg("status", "running"),
+		),
+	}
+	containers, err := w.cli.ContainerList(ctx, options)
+	if err != nil {
+		return err
+	}
+
+	for _, c := range containers {
+		mountPoints := w.convertMounts(c.Mounts)
+		if len(mountPoints) > 0 {
+			w.mountPoints[c.ID] = mountPoints
+		}
+	}
+
+	return nil
+}
+
+func (w *watcher) convertMounts(mounts []types.MountPoint) []mountPoint {
+	mountPoints := make([]mountPoint, len(mounts))
+	for i, m := range mounts {
+		hostDir := convertDockerMountSourceDirToHostDir(m.Source)
+		var ignoreDirs []string
+		for _, ignoreDir := range w.ignoreDirs {
+			if filepath.IsAbs(ignoreDir) {
+				if hasPrefixFilePath(ignoreDir, hostDir) {
+					ignoreDirs = append(ignoreDirs, ignoreDir)
+				}
+			} else {
+				ignoreDirs = append(ignoreDirs, filepath.Join(hostDir, ignoreDir))
+			}
+		}
+
+		mountPoints[i] = mountPoint{
+			hostDir:      hostDir,
+			containerDir: m.Destination,
+			ignoreDirs:   ignoreDirs,
+		}
+	}
+	return mountPoints
+}
+
+func (w *watcher) getMountPoints(ctx context.Context, containerID string) ([]mountPoint, error) {
+	res, err := w.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return nil, err
+	}
+	return w.convertMounts(res.Mounts), nil
 }
 
 func watchContainerEvents(ctx context.Context, cli *client.Client) (<-chan events.Message, <-chan error) {
@@ -138,34 +214,98 @@ func watchContainerEvents(ctx context.Context, cli *client.Client) (<-chan event
 	return cli.Events(ctx, options)
 }
 
-func (w *watcher) addWatchDirs(hostDir string) error {
+func (w *watcher) addWatchDirsForMountPoints(containerID string, mountPoints []mountPoint) error {
+	for i, mp := range mountPoints {
+		err := w.addWatchDirs(mp)
+		if err != nil {
+			return err
+		}
+		log.Printf("watching mount[%d]: containerID=%s, hostDir=%s",
+			i, stringid.TruncateID(containerID), mp.hostDir)
+	}
+	return nil
+}
+
+func (w *watcher) addWatchDirs(mp mountPoint) error {
 	watchDir := func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if fi.IsDir() {
-			if strings.HasPrefix(fi.Name(), ".") {
-				return filepath.SkipDir
-			}
-
-			if err := w.hostDirWatcher.Add(path); err != nil {
-				return err
-			}
+		if !fi.IsDir() {
+			return nil
 		}
+
+		if mp.IgnoredPath(path) {
+			log.Printf("skip add watch dir=%s", path)
+			return filepath.SkipDir
+		}
+
+		if err := w.hostDirWatcher.Add(path); err != nil {
+			return err
+		}
+		log.Printf("added watch dir=%s", path)
+
 		return nil
 	}
-	return filepath.Walk(hostDir, watchDir)
+	return filepath.Walk(mp.hostDir, watchDir)
+}
+
+func (w *watcher) removeWatchDirsForMountPoints(containerID string, mountPoints []mountPoint) error {
+	for i, mp := range mountPoints {
+		err := w.removeWatchDirs(mp)
+		if err != nil {
+			return err
+		}
+		log.Printf("unwatching mount[%d]: containerID=%s, hostDir=%s",
+			i, stringid.TruncateID(containerID), mp.hostDir)
+	}
+	return nil
+}
+
+func (w *watcher) removeWatchDirs(mp mountPoint) error {
+	watchDir := func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !fi.IsDir() {
+			return nil
+		}
+
+		if mp.IgnoredPath(path) {
+			log.Printf("skip remove watch dir=%s", path)
+			return filepath.SkipDir
+		}
+
+		if err := w.hostDirWatcher.Remove(path); err != nil {
+			// NOTE: We ignore error here since we may call Remove for path
+			// which we had not call Add.
+			return nil
+		}
+		log.Printf("removed watch dir=%s", path)
+
+		return nil
+	}
+	return filepath.Walk(mp.hostDir, watchDir)
 }
 
 func (w *watcher) mayAddWatchDir(hostDir string) error {
-	ok, err := isDir(hostDir)
+	fi, err := os.Stat(hostDir)
 	if err != nil {
 		return err
 	}
-
-	if !ok {
+	if !fi.IsDir() {
 		return nil
 	}
+
+	cid, mp := w.lookupMountPoint(hostDir)
+	if cid == "" {
+		return nil
+	}
+
+	if mp.IgnoredPath(hostDir) {
+		return nil
+	}
+
 	err = w.hostDirWatcher.Add(hostDir)
 	if err != nil {
 		return fmt.Errorf("failed to add watch dir=%s, err=%v", hostDir, err)
@@ -174,89 +314,49 @@ func (w *watcher) mayAddWatchDir(hostDir string) error {
 	return nil
 }
 
-func isDir(path string) (bool, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return false, err
-	}
-	return fi.IsDir(), nil
-}
-
-func (w *watcher) listMountPoints(ctx context.Context, hostDir string) ([]mountPoint, error) {
-	options := types.ContainerListOptions{
-		All: true,
-		Filters: filters.NewArgs(
-			filters.Arg("status", "created"),
-			filters.Arg("status", "restarting"),
-			filters.Arg("status", "running"),
-			filters.Arg("status", "paused"),
-		),
-	}
-	containers, err := w.cli.ContainerList(ctx, options)
-	if err != nil {
-		return nil, err
-	}
-	var mountPoints []mountPoint
-	for _, c := range containers {
-		//log.Printf("container=%+v", c)
-		for _, m := range c.Mounts {
-			mp := mountPoint{
-				containerID:  c.ID,
-				hostDir:      convertDockerMountSourceDirToHostDir(m.Source),
-				containerDir: m.Destination,
-			}
-			if hasPrefixFilePath(hostDir, mp.hostDir) {
-				err := verifyContainerHavingStatAndChmod(ctx, w.cli, mp.containerID)
-				if err != nil {
-					log.Printf("skip container id=%s since it is not running or does not have \"stat\" or \"chmod\" command, err=%v\n",
-						stringid.TruncateID(mp.containerID), err)
-					continue
-				}
-				mountPoints = append(mountPoints, mp)
+func (w *watcher) lookupMountPoint(hostPath string) (string, mountPoint) {
+	for cid, mountPoints := range w.mountPoints {
+		for _, mp := range mountPoints {
+			if hasPrefixFilePath(hostPath, mp.hostDir) {
+				return cid, mp
 			}
 		}
 	}
-
-	if len(mountPoints) == 0 {
-		log.Printf("no watching mount")
-	} else {
-		for i, mp := range mountPoints {
-			log.Printf("watching mount[%d]: containerID=%s, hostDir=%s, containerDir=%s",
-				i, stringid.TruncateID(mp.containerID), mp.hostDir, mp.containerDir)
-		}
-	}
-
-	return mountPoints, nil
+	return "", mountPoint{}
 }
 
-func (w *watcher) notifyWriteToContainer(ctx context.Context, mountPoints []mountPoint, hostPath string) error {
-	for _, mp := range mountPoints {
-		if !hasPrefixFilePath(hostPath, mp.hostDir) {
-			continue
-		}
-
-		containerPath := convertHostPathToContainerPath(
-			mp.hostDir, mp.containerDir, hostPath)
-		var buf bytes.Buffer
-		err := dockerExec(ctx, w.cli, mp.containerID,
-			[]string{"stat", "-c", "%a", containerPath},
-			&buf, os.Stderr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "skip notify since stat failed; err=%s\n", err)
-			continue
-		}
-		perm := strings.TrimSuffix(buf.String(), "\n")
-		err = dockerExec(ctx, w.cli, mp.containerID,
-			[]string{"chmod", perm, containerPath},
-			ioutil.Discard, os.Stderr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to notify since chmod failed; err=%s\n", err)
-			continue
-		}
-
-		log.Printf("notified to container %s, hostPath=%s, containerPath=%s\n",
-			stringid.TruncateID(mp.containerID), hostPath, containerPath)
+func (w *watcher) notifyWriteToContainer(ctx context.Context, hostPath string) error {
+	containerID, mp := w.lookupMountPoint(hostPath)
+	if containerID == "" {
+		return nil
 	}
+
+	containerPath := convertHostPathToContainerPath(
+		mp.hostDir, mp.containerDir, hostPath)
+
+	if mp.IgnoredPath(hostPath) {
+		return nil
+	}
+
+	var buf bytes.Buffer
+	err := dockerExec(ctx, w.cli, containerID,
+		[]string{"stat", "-c", "%a", containerPath},
+		&buf, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "skip notify since stat failed; err=%s\n", err)
+		return nil
+	}
+	perm := strings.TrimSuffix(buf.String(), "\n")
+	err = dockerExec(ctx, w.cli, containerID,
+		[]string{"chmod", perm, containerPath},
+		ioutil.Discard, os.Stderr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to notify since chmod failed; err=%s\n", err)
+		return nil
+	}
+
+	log.Printf("notified to container %s, hostPath=%s, containerPath=%s\n",
+		stringid.TruncateID(containerID), hostPath, containerPath)
 	return nil
 }
 
@@ -282,30 +382,6 @@ func verifyContainerHavingStatAndChmod(ctx context.Context, cli *client.Client, 
 	return chmodErr
 }
 
-func validateHostDir(hostDir string) error {
-	if !filepath.IsAbs(hostDir) {
-		return errors.New("hostdir must be an absolute path")
-	}
-	volName := filepath.VolumeName(hostDir)
-	if len(volName) != 2 || volName[1] != ':' {
-		return errors.New("hostdir must not be a network path")
-	}
-
-	fi, err := os.Lstat(hostDir)
-	if err != nil {
-		return fmt.Errorf("hostdir must exist; err=%v", err)
-	}
-	if !fi.IsDir() {
-		return errors.New("hostdir must be a directory")
-	}
-	return nil
-}
-
-func cleanHostDir(hostDir string) string {
-	hostDir = filepath.Clean(hostDir)
-	return strings.ToUpper(hostDir[:1]) + hostDir[1:]
-}
-
 func convertDockerMountSourceDirToHostDir(source string) string {
 	if !strings.HasPrefix(source, "/host_mnt/") {
 		panic(fmt.Sprintf("unexpected docker mount source directory path format, source=%s", source))
@@ -320,4 +396,13 @@ func convertHostPathToContainerPath(hostDir, containerDir, hostPath string) stri
 		panic(fmt.Sprintf("unexpected error for getting relative path, basepath=%s, targpath=%s, err=%s\n", hostDir, hostPath, err))
 	}
 	return path.Join(containerDir, filepath.ToSlash(rel))
+}
+
+func (mp *mountPoint) IgnoredPath(path string) bool {
+	for _, ignoreDir := range mp.ignoreDirs {
+		if hasPrefixFilePath(path, ignoreDir) {
+			return true
+		}
+	}
+	return false
 }
