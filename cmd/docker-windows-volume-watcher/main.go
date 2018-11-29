@@ -7,12 +7,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 
 	watcher "github.com/hnakamur/docker-windows-volume-watcher"
 )
 
 func main() {
-	hostDir := flag.String("hostdir", "", "host directory to watch")
+	ignoreDir := flag.String("ignoredir", "", `ignore directories, semilocon separated directories. relative to mount point (e.g. build\html) or absolute`)
 	apiVer := flag.String("apiver", "1.38", "Docker API version")
 	flag.Parse()
 
@@ -24,12 +25,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		<-c
-		log.Printf("received signal")
 		cancel()
-		log.Printf("called cancel")
 	}()
 
-	err := watcher.Watch(ctx, *apiVer, *hostDir)
+	var ignoreDirs []string
+	if *ignoreDir != "" {
+		ignoreDirs = strings.Split(*ignoreDir, ";")
+	}
+	err := watcher.Watch(ctx, *apiVer, ignoreDirs)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
